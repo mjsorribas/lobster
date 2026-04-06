@@ -8,7 +8,7 @@ import { PassThrough } from 'node:stream';
 import { parsePipeline } from '../parser.js';
 import { runPipeline } from '../runtime.js';
 import { encodeToken } from '../token.js';
-import { deleteStateJson, readStateJson, writeStateJson } from '../state/store.js';
+import { createApprovalIndex, deleteStateJson, readStateJson, writeStateJson } from '../state/store.js';
 import { readLineFromStream } from '../read_line.js';
 import { resolveInlineShellCommand } from '../shell.js';
 
@@ -61,6 +61,7 @@ export type WorkflowRunResult = {
     items: unknown[];
     preview?: string;
     resumeToken?: string;
+    approvalId?: string;
   };
 };
 
@@ -272,6 +273,14 @@ export async function runWorkflowFile({
           createdAt: new Date().toISOString(),
         });
 
+        let approvalId: string;
+        try {
+          approvalId = await createApprovalIndex({ env: ctx.env, stateKey });
+        } catch (err) {
+          await deleteStateJson({ env: ctx.env, key: stateKey }).catch(() => {});
+          throw err;
+        }
+
         if (consumedResumeStateKey && consumedResumeStateKey !== stateKey) {
           await deleteStateJson({ env: ctx.env, key: consumedResumeStateKey });
         }
@@ -289,6 +298,7 @@ export async function runWorkflowFile({
           requiresApproval: {
             ...approval,
             resumeToken,
+            approvalId,
           },
         };
       }
