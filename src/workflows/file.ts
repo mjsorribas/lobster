@@ -75,7 +75,19 @@ export type WorkflowApproval =
     prompt?: string;
     items?: unknown[];
     preview?: string;
+    initiated_by?: string;
+    initiatedBy?: string;
+    required_approver?: string;
+    requiredApprover?: string;
+    require_different_approver?: boolean;
+    requireDifferentApprover?: boolean;
   };
+
+type WorkflowApprovalIdentity = {
+  initiatedBy?: string;
+  requiredApprover?: string;
+  requireDifferentApprover?: boolean;
+};
 
 export type WorkflowInputRequest = {
   prompt: string;
@@ -88,6 +100,8 @@ export type WorkflowStepResult = {
   stdout?: string;
   json?: unknown;
   approved?: boolean;
+  initiatedBy?: string;
+  approvedBy?: string;
   subject?: unknown;
   response?: unknown;
   skipped?: boolean;
@@ -103,6 +117,9 @@ export type WorkflowRunResult = {
     prompt: string;
     items: unknown[];
     preview?: string;
+    initiatedBy?: string;
+    requiredApprover?: string;
+    requireDifferentApprover?: boolean;
     resumeToken?: string;
     approvalId?: string;
   };
@@ -145,6 +162,7 @@ export type WorkflowResumePayload = {
   steps?: Record<string, WorkflowStepResult>;
   args?: Record<string, unknown>;
   approvalStepId?: string;
+  approvalIdentity?: WorkflowApprovalIdentity;
   inputStepId?: string;
   inputSchema?: unknown;
   inputSubject?: unknown;
@@ -156,6 +174,7 @@ type WorkflowResumeState = {
   steps: Record<string, WorkflowStepResult>;
   args: Record<string, unknown>;
   approvalStepId?: string;
+  approvalIdentity?: WorkflowApprovalIdentity;
   inputStepId?: string;
   inputSchema?: unknown;
   inputSubject?: unknown;
@@ -417,6 +436,33 @@ export async function loadWorkflowFile(filePath: string): Promise<WorkflowFile> 
         throw new Error(`Workflow step ${step.id} input.responseSchema is invalid: ${err?.message ?? String(err)}`);
       }
     }
+    if (step.approval && typeof step.approval === 'object' && !Array.isArray(step.approval)) {
+      const approval = step.approval as Record<string, unknown>;
+      if (approval.initiated_by !== undefined && typeof approval.initiated_by !== 'string') {
+        throw new Error(`Workflow step ${step.id} approval.initiated_by must be a string`);
+      }
+      if (approval.initiatedBy !== undefined && typeof approval.initiatedBy !== 'string') {
+        throw new Error(`Workflow step ${step.id} approval.initiatedBy must be a string`);
+      }
+      if (approval.required_approver !== undefined && typeof approval.required_approver !== 'string') {
+        throw new Error(`Workflow step ${step.id} approval.required_approver must be a string`);
+      }
+      if (approval.requiredApprover !== undefined && typeof approval.requiredApprover !== 'string') {
+        throw new Error(`Workflow step ${step.id} approval.requiredApprover must be a string`);
+      }
+      if (
+        approval.require_different_approver !== undefined
+        && typeof approval.require_different_approver !== 'boolean'
+      ) {
+        throw new Error(`Workflow step ${step.id} approval.require_different_approver must be a boolean`);
+      }
+      if (
+        approval.requireDifferentApprover !== undefined
+        && typeof approval.requireDifferentApprover !== 'boolean'
+      ) {
+        throw new Error(`Workflow step ${step.id} approval.requireDifferentApprover must be a boolean`);
+      }
+    }
     if (
       step.timeout_ms !== undefined
       && (
@@ -542,7 +588,16 @@ export async function runWorkflowFile({
 
     if (resumeState?.approvalStepId && typeof approved === 'boolean') {
       const previous = results[resumeState.approvalStepId] ?? { id: resumeState.approvalStepId };
+      const approvedBy = String(ctx.env.LOBSTER_APPROVAL_APPROVED_BY ?? '').trim() || undefined;
+      if (approved === true) {
+        enforceApprovalIdentity({
+          stepId: resumeState.approvalStepId,
+          identity: resumeState.approvalIdentity,
+          approvedBy,
+        });
+      }
       previous.approved = approved;
+      if (approvedBy) previous.approvedBy = approvedBy;
       results[resumeState.approvalStepId] = previous;
     }
 
@@ -1001,7 +1056,11 @@ export async function runWorkflowFile({
     }
 
     if (isApprovalStep(step.approval)) {
-      const approval = extractApprovalRequest(step, results[step.id]);
+      const approval = extractApprovalRequest(step, results[step.id], ctx.env);
+      const approvalIdentity = approvalIdentityFromRequest(approval);
+      if (approvalIdentity.initiatedBy) {
+        results[step.id].initiatedBy = approvalIdentity.initiatedBy;
+      }
 
       if (ctx.mode === 'tool' || !isInteractive(ctx.stdin)) {
         const stateKey = await saveWorkflowResumeState(ctx.env, {
@@ -1010,6 +1069,7 @@ export async function runWorkflowFile({
           steps: results,
           args: resolvedArgs,
           approvalStepId: step.id,
+          approvalIdentity,
           createdAt: new Date().toISOString(),
         });
 
@@ -1050,7 +1110,14 @@ export async function runWorkflowFile({
       if (!/^y(es)?$/i.test(String(answer).trim())) {
         throw new Error('Not approved');
       }
+      const approvedBy = String(ctx.env.LOBSTER_APPROVAL_APPROVED_BY ?? '').trim() || undefined;
+      enforceApprovalIdentity({
+        stepId: step.id,
+        identity: approvalIdentity,
+        approvedBy,
+      });
       results[step.id].approved = true;
+      if (approvedBy) results[step.id].approvedBy = approvedBy;
     }
   }
 
@@ -1520,32 +1587,79 @@ function isInputStep(input: WorkflowStep['input']) {
   return Boolean(input && typeof input === 'object' && !Array.isArray(input));
 }
 
-function extractApprovalRequest(step: WorkflowStep, result: WorkflowStepResult) {
+function extractApprovalRequest(
+  step: WorkflowStep,
+  result: WorkflowStepResult,
+  env?: Record<string, string | undefined>,
+) {
   const approvalConfig = normalizeApprovalConfig(step.approval);
+  const configIdentity = approvalIdentityFromRaw(approvalConfig);
+  if (!configIdentity.initiatedBy) {
+    const fromEnv = String(env?.LOBSTER_APPROVAL_INITIATED_BY ?? '').trim();
+    if (fromEnv) configIdentity.initiatedBy = fromEnv;
+  }
+  if (!configIdentity.requiredApprover) {
+    const fromEnv = String(env?.LOBSTER_APPROVAL_REQUIRED_APPROVER ?? '').trim();
+    if (fromEnv) configIdentity.requiredApprover = fromEnv;
+  }
+  if (!configIdentity.requireDifferentApprover) {
+    const fromEnv = parseBoolLike(env?.LOBSTER_APPROVAL_REQUIRE_DIFFERENT_APPROVER);
+    if (fromEnv === true) configIdentity.requireDifferentApprover = true;
+  }
   const fallbackPrompt = approvalConfig.prompt ?? `Approve ${step.id}?`;
   const json = result.json;
 
   if (json && typeof json === 'object' && !Array.isArray(json)) {
     const candidate = json as {
-      requiresApproval?: { prompt?: string; items?: unknown[]; preview?: string };
+      requiresApproval?: {
+        prompt?: string;
+        items?: unknown[];
+        preview?: string;
+        initiated_by?: string;
+        initiatedBy?: string;
+        required_approver?: string;
+        requiredApprover?: string;
+        require_different_approver?: boolean;
+        requireDifferentApprover?: boolean;
+      };
       prompt?: string;
       items?: unknown[];
       preview?: string;
+      initiated_by?: string;
+      initiatedBy?: string;
+      required_approver?: string;
+      requiredApprover?: string;
+      require_different_approver?: boolean;
+      requireDifferentApprover?: boolean;
     };
     if (candidate.requiresApproval?.prompt) {
+      const identity = {
+        ...configIdentity,
+        ...approvalIdentityFromRaw(candidate.requiresApproval as Record<string, unknown>),
+      };
       return {
         type: 'approval_request' as const,
         prompt: candidate.requiresApproval.prompt,
         items: candidate.requiresApproval.items ?? [],
         ...(candidate.requiresApproval.preview ? { preview: candidate.requiresApproval.preview } : null),
+        ...(identity.initiatedBy ? { initiatedBy: identity.initiatedBy } : null),
+        ...(identity.requiredApprover ? { requiredApprover: identity.requiredApprover } : null),
+        ...(identity.requireDifferentApprover ? { requireDifferentApprover: true } : null),
       };
     }
     if (candidate.prompt) {
+      const identity = {
+        ...configIdentity,
+        ...approvalIdentityFromRaw(candidate as Record<string, unknown>),
+      };
       return {
         type: 'approval_request' as const,
         prompt: candidate.prompt,
         items: candidate.items ?? [],
         ...(candidate.preview ? { preview: candidate.preview } : null),
+        ...(identity.initiatedBy ? { initiatedBy: identity.initiatedBy } : null),
+        ...(identity.requiredApprover ? { requiredApprover: identity.requiredApprover } : null),
+        ...(identity.requireDifferentApprover ? { requireDifferentApprover: true } : null),
       };
     }
   }
@@ -1558,7 +1672,74 @@ function extractApprovalRequest(step: WorkflowStep, result: WorkflowStepResult) 
     prompt: fallbackPrompt,
     items,
     ...(preview ? { preview } : null),
+    ...(configIdentity.initiatedBy ? { initiatedBy: configIdentity.initiatedBy } : null),
+    ...(configIdentity.requiredApprover ? { requiredApprover: configIdentity.requiredApprover } : null),
+    ...(configIdentity.requireDifferentApprover ? { requireDifferentApprover: true } : null),
   };
+}
+
+function approvalIdentityFromRaw(
+  raw: Record<string, unknown> | NormalizedApprovalConfig | null | undefined,
+): WorkflowApprovalIdentity {
+  if (!raw) return {};
+  const value = raw as Record<string, unknown>;
+  const initiatedBy = String(value.initiatedBy ?? value.initiated_by ?? '').trim() || undefined;
+  const requiredApprover = String(value.requiredApprover ?? value.required_approver ?? '').trim() || undefined;
+  const requireDifferentRaw = value.requireDifferentApprover ?? value.require_different_approver;
+  const requireDifferentApprover = typeof requireDifferentRaw === 'boolean' ? requireDifferentRaw : undefined;
+  return {
+    ...(initiatedBy ? { initiatedBy } : null),
+    ...(requiredApprover ? { requiredApprover } : null),
+    ...(requireDifferentApprover === true ? { requireDifferentApprover: true } : null),
+  };
+}
+
+function approvalIdentityFromRequest(request: WorkflowRunResult['requiresApproval']): WorkflowApprovalIdentity {
+  if (!request) return {};
+  return {
+    ...(request.initiatedBy ? { initiatedBy: request.initiatedBy } : null),
+    ...(request.requiredApprover ? { requiredApprover: request.requiredApprover } : null),
+    ...(request.requireDifferentApprover ? { requireDifferentApprover: true } : null),
+  };
+}
+
+function enforceApprovalIdentity({
+  stepId,
+  identity,
+  approvedBy,
+}: {
+  stepId: string;
+  identity: WorkflowApprovalIdentity | undefined;
+  approvedBy?: string;
+}) {
+  const policy = identity ?? {};
+  const approver = String(approvedBy ?? '').trim() || undefined;
+
+  if (!policy.requiredApprover && !policy.requireDifferentApprover) return;
+  if (!approver) {
+    throw new WorkflowResumeArgumentError(
+      `Workflow step ${stepId} approval requires approver identity; set LOBSTER_APPROVAL_APPROVED_BY`,
+    );
+  }
+  if (policy.requiredApprover && approver !== policy.requiredApprover) {
+    throw new WorkflowResumeArgumentError(
+      `Workflow step ${stepId} approval requires approver '${policy.requiredApprover}', got '${approver}'`,
+    );
+  }
+  if (policy.requireDifferentApprover && policy.initiatedBy && approver === policy.initiatedBy) {
+    throw new WorkflowResumeArgumentError(
+      `Workflow step ${stepId} approval must be granted by someone other than '${policy.initiatedBy}'`,
+    );
+  }
+}
+
+function parseBoolLike(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value;
+  if (value === undefined || value === null) return undefined;
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'n'].includes(normalized)) return false;
+  return undefined;
 }
 
 function trackStepCost(costTracker: CostTracker, stepId: string, result: WorkflowStepResult) {
@@ -2289,17 +2470,42 @@ function serializeValueForStdout(value: unknown) {
   return JSON.stringify(value);
 }
 
-function normalizeApprovalConfig(approval: WorkflowStep['approval']) {
+type NormalizedApprovalConfig = {
+  prompt?: string;
+  items?: unknown[];
+  preview?: string;
+  initiatedBy?: string;
+  requiredApprover?: string;
+  requireDifferentApprover?: boolean;
+};
+
+function normalizeApprovalConfig(approval: WorkflowStep['approval']): NormalizedApprovalConfig {
   if (approval === true || approval === 'required' || approval === undefined || approval === false) {
-    return {} as { prompt?: string; items?: unknown[]; preview?: string };
+    return {};
   }
   if (typeof approval === 'string') {
     return { prompt: approval };
   }
   if (approval && typeof approval === 'object' && !Array.isArray(approval)) {
-    return approval;
+    const value = approval as Record<string, unknown>;
+    return {
+      ...(typeof value.prompt === 'string' ? { prompt: value.prompt } : null),
+      ...(Array.isArray(value.items) ? { items: value.items } : null),
+      ...(typeof value.preview === 'string' ? { preview: value.preview } : null),
+      ...(typeof value.initiatedBy === 'string'
+        ? { initiatedBy: value.initiatedBy }
+        : (typeof value.initiated_by === 'string' ? { initiatedBy: value.initiated_by } : null)),
+      ...(typeof value.requiredApprover === 'string'
+        ? { requiredApprover: value.requiredApprover }
+        : (typeof value.required_approver === 'string' ? { requiredApprover: value.required_approver } : null)),
+      ...(typeof value.requireDifferentApprover === 'boolean'
+        ? { requireDifferentApprover: value.requireDifferentApprover }
+        : (typeof value.require_different_approver === 'boolean'
+          ? { requireDifferentApprover: value.require_different_approver }
+          : null)),
+    };
   }
-  return {} as { prompt?: string; items?: unknown[]; preview?: string };
+  return {};
 }
 
 function normalizeApprovalItems(value: unknown) {

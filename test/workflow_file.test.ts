@@ -313,6 +313,147 @@ test('workflow approval resumes require an explicit decision', async () => {
   );
 });
 
+test('workflow approval can require a different approver than initiator', async () => {
+  const workflow = {
+    steps: [
+      {
+        id: 'gate',
+        approval: {
+          prompt: 'Proceed?',
+          require_different_approver: true,
+        },
+      },
+      {
+        id: 'finish',
+        run: 'node -e "process.stdout.write(JSON.stringify({done:true}))"',
+        when: '$gate.approved',
+      },
+    ],
+  };
+
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'lobster-workflow-approval-identity-'));
+  const stateDir = path.join(tmpDir, 'state');
+  const filePath = path.join(tmpDir, 'workflow.lobster');
+  await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), 'utf8');
+
+  const baseEnv = {
+    ...process.env,
+    LOBSTER_STATE_DIR: stateDir,
+    LOBSTER_APPROVAL_INITIATED_BY: 'agent-1',
+  };
+
+  const first = await runWorkflowFile({
+    filePath,
+    ctx: { stdin: process.stdin, stdout: process.stdout, stderr: process.stderr, env: baseEnv, mode: 'tool' },
+  });
+  assert.equal(first.status, 'needs_approval');
+  assert.equal(first.requiresApproval?.initiatedBy, 'agent-1');
+  assert.equal(first.requiresApproval?.requireDifferentApprover, true);
+
+  const payload = decodeResumeToken(first.requiresApproval?.resumeToken ?? '');
+  assert.equal(payload.kind, 'workflow-file');
+
+  await assert.rejects(
+    () =>
+      runWorkflowFile({
+        filePath,
+        ctx: {
+          stdin: process.stdin,
+          stdout: process.stdout,
+          stderr: process.stderr,
+          env: { ...baseEnv, LOBSTER_APPROVAL_APPROVED_BY: 'agent-1' },
+          mode: 'tool',
+        },
+        resume: payload,
+        approved: true,
+      }),
+    /must be granted by someone other than 'agent-1'/i,
+  );
+
+  const resumed = await runWorkflowFile({
+    filePath,
+    ctx: {
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: { ...baseEnv, LOBSTER_APPROVAL_APPROVED_BY: 'human-1' },
+      mode: 'tool',
+    },
+    resume: payload,
+    approved: true,
+  });
+  assert.equal(resumed.status, 'ok');
+  assert.deepEqual(resumed.output, [{ done: true }]);
+});
+
+test('workflow approval can require a specific approver identity', async () => {
+  const workflow = {
+    steps: [
+      {
+        id: 'gate',
+        approval: {
+          prompt: 'Proceed?',
+          required_approver: 'alice',
+        },
+      },
+      {
+        id: 'finish',
+        run: 'node -e "process.stdout.write(JSON.stringify({done:true}))"',
+        when: '$gate.approved',
+      },
+    ],
+  };
+
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'lobster-workflow-required-approver-'));
+  const stateDir = path.join(tmpDir, 'state');
+  const filePath = path.join(tmpDir, 'workflow.lobster');
+  await fsp.writeFile(filePath, JSON.stringify(workflow, null, 2), 'utf8');
+
+  const env = { ...process.env, LOBSTER_STATE_DIR: stateDir };
+
+  const first = await runWorkflowFile({
+    filePath,
+    ctx: { stdin: process.stdin, stdout: process.stdout, stderr: process.stderr, env, mode: 'tool' },
+  });
+  assert.equal(first.status, 'needs_approval');
+  assert.equal(first.requiresApproval?.requiredApprover, 'alice');
+
+  const payload = decodeResumeToken(first.requiresApproval?.resumeToken ?? '');
+  assert.equal(payload.kind, 'workflow-file');
+
+  await assert.rejects(
+    () =>
+      runWorkflowFile({
+        filePath,
+        ctx: {
+          stdin: process.stdin,
+          stdout: process.stdout,
+          stderr: process.stderr,
+          env: { ...env, LOBSTER_APPROVAL_APPROVED_BY: 'bob' },
+          mode: 'tool',
+        },
+        resume: payload,
+        approved: true,
+      }),
+    /requires approver 'alice', got 'bob'/i,
+  );
+
+  const resumed = await runWorkflowFile({
+    filePath,
+    ctx: {
+      stdin: process.stdin,
+      stdout: process.stdout,
+      stderr: process.stderr,
+      env: { ...env, LOBSTER_APPROVAL_APPROVED_BY: 'alice' },
+      mode: 'tool',
+    },
+    resume: payload,
+    approved: true,
+  });
+  assert.equal(resumed.status, 'ok');
+  assert.deepEqual(resumed.output, [{ done: true }]);
+});
+
 test('workflow conditions support comparisons, boolean operators, and parentheses', async () => {
   const workflow = {
     steps: [

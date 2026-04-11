@@ -208,6 +208,12 @@ Notes:
 - `pipeline:` shares the same args/env/results model as shell steps, so later steps can still reference `$step.stdout` or `$step.json`.
 - If you need a human checkpoint before an LLM call, use a dedicated `approval:` step in the workflow file rather than `approve` inside the nested pipeline.
 - `cwd`, `env`, `stdin`, `when`, and `condition` work for both shell and pipeline steps.
+- Approval steps can optionally enforce identity constraints:
+  - `approval.required_approver` (or `requiredApprover`) requires an exact approver id.
+  - `approval.require_different_approver` (or `requireDifferentApprover`) requires approver id to differ from initiator.
+  - `approval.initiated_by` (or `initiatedBy`) sets the initiator id for comparison.
+  - `LOBSTER_APPROVAL_INITIATED_BY` can provide a default initiator id at run time.
+  - `LOBSTER_APPROVAL_APPROVED_BY` is used at resume/approval time for identity checks.
 
 ## Visualizing workflows
 
